@@ -140,7 +140,7 @@ class Program
                 {
                     _valueOrEndPromise.SetResult(true);
                 }
-                else if (previousState == -1 || (previousState & 1) == 0)
+                else if (previousState == -1)
                 {
                     // If we came from the start, we'll pretend that the state machine ran.
                     // This way, the value will be properly yielded in the following TryGetNext
