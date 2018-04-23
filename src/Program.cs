@@ -76,8 +76,10 @@ class Program
     private sealed class Unprounouncable : CompilerImplementationDetails.AsyncIteratorBase<int>
     {
         // MoveNext returns with either:
-        //  1. a state that has a value (or finished state),
-        //  2. or a promise of a future value (or finished state) that you can wait on.
+        //  1. A promise of a future value (or finished state) that you can wait on
+        //      - may already be completed (ie. reaching `yield` right from start)
+        //      - may not be completed (ie. reaching an `await`)
+        //  2. A state that has a value (or finished state). (no promise necessary since value available) (ie. `yield` after `yield`)
         //
         // await:
         // get task and store it in awaiter (awaiter = task.GetAwaiter())
@@ -140,7 +142,7 @@ class Program
                 }
                 else if (previousState == -1 || (previousState & 1) == 0)
                 {
-                    // If we came from the start or yield state, we'll pretend that the state machine ran.
+                    // If we came from the start, we'll pretend that the state machine ran.
                     // This way, the value will be properly yielded in the following TryGetNext
                     _valueOrEndPromise = CompilerImplementationDetails.s_completed;
                 }
@@ -202,6 +204,7 @@ public static class CompilerImplementationDetails
         public AsyncTaskMethodBuilder<int> Builder; // used for getting a callback to MoveNext when async code completes
 
         // If the promise is set, then don't check the machine state from code that isn't actively running the machine. The machine may be running on another thread.
+        // The promise being set and completed signals there is a value that has not yet been yielded.
         protected TaskCompletionSource<bool> _valueOrEndPromise; // promise for a value or end (true means value found, false means finished state)
 
         // Contract: WaitForNextAsync will either return a false (no value left) or a true (found a value) with the promise set (to signal an unreturned value is stored).
