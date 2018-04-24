@@ -93,6 +93,8 @@ class Program
         //      - may not be completed (ie. reaching an `await`)
         //  2. A state that has a value (or finished state). (no promise necessary since value available) (ie. `yield` after `yield`)
         //
+        // When the promise completes, the state machine will be stopped on a `yield` state.
+        //
         // await:
         // get task and store it in awaiter (awaiter = task.GetAwaiter())
         // if not already completed:
@@ -105,7 +107,7 @@ class Program
         //
         // yield:
         // set current,
-        // set state (odd value),
+        // set state,
         // if someone was promised a value, complete promise with true (value found)
         // return
         //
@@ -139,12 +141,11 @@ class Program
             {
                 // yield:
                 // set current,
-                // set state (odd value),
+                // set state,
                 // if someone was promised a value, complete promise with true (value found)
                 // return
                 _current = value;
 
-                Debug.Assert((state & 1) != 0); // odd states for 'yield'
                 int previousState = State;
                 State = state;
 
@@ -209,8 +210,7 @@ public static class CompilerImplementationDetails
     {
         public abstract void MoveNext();
 
-        public int State; // -1 means not-yet-started, -2 means finished, even values correspond to 'await' states and odd values correspond to 'yield' states
-        private bool IsYieldState => State > 0 && (State & 1) != 0; // odd states have values from 'yield'
+        public int State; // -1 means not-yet-started, -2 means finished
 
         // current is used for 'yield' in the method body
         protected T _current; // only populated for states that have values
@@ -236,16 +236,15 @@ public static class CompilerImplementationDetails
                 }
 
                 MoveNext();
+                // MoveNext always returns with a promise of a future value, reaching end state, or an immediately available value
                 if (_valueOrEndPromise is null)
                 {
                     if (State == -2)
                     {
                         return s_falseTask;
                     }
-                    else if (IsYieldState)
-                    {
-                        return s_trueTask;
-                    }
+
+                    return s_trueTask;
                 }
             }
 
@@ -257,13 +256,12 @@ public static class CompilerImplementationDetails
             if (_valueOrEndPromise != null)
             {
                 // if this is the first TryGetNext call after WaitForNext, then we'll return the value we already have
-                _valueOrEndPromise = null;
+                _valueOrEndPromise = null; // clear the promise, so that the next call to TryGetNext can move forward
             }
             else
             {
                 // throw if state == -1 (you should call WaitForNextAsync first, ie. when in starting state)
-                // throw if state doesn't have value
-                if (State == -1 || !IsYieldState) throw new Exception("You should call WaitForNextAsync first");
+                if (State == -1) throw new Exception("You should call WaitForNextAsync first");
 
                 // otherwise, call MoveNext (to get a value or a promise of one)
                 MoveNext();
@@ -278,7 +276,6 @@ public static class CompilerImplementationDetails
             }
 
             // if no promise, the machine is stopped and state has value, so return it (success)
-            Debug.Assert(IsYieldState);
             success = true;
             return _current;
         }
