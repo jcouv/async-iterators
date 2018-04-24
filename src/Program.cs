@@ -42,6 +42,13 @@ using System.Threading.Tasks;
 //    Task Slow() => throw null;
 //}
 
+// TODO: How to test all the possible transitions?
+// start
+// await
+// await-shortcut
+// yield
+// end
+
 class Program
 {
     static async Task Main()
@@ -49,6 +56,11 @@ class Program
         IAsyncEnumerable<int> test = AsyncIterator();
         IAsyncEnumerator<int> enumerable = test.GetAsyncEnumerator();
 
+        // TODO: do we need the inner loop?
+        //foreach await (var value in enumerable)
+        //{
+        //    Console.WriteLine(value)
+        //}
         while (await enumerable.WaitForNextAsync())
         {
             while (true)
@@ -65,7 +77,7 @@ class Program
     static IAsyncEnumerable<int> AsyncIterator()
     {
         var stateMachine = new Unprounouncable();
-        stateMachine.State = -1;
+        stateMachine.State = -1; // TODO: should state be -2 ?
         stateMachine.Builder = AsyncTaskMethodBuilder<int>.Create();
         // note: we don't start the machine.
         return stateMachine;
@@ -142,6 +154,8 @@ class Program
                 }
                 else if (previousState == -1)
                 {
+                    // TODO: what if we came from a short-circuited await?
+
                     // If we came from the start, we'll pretend that the state machine ran.
                     // This way, the value will be properly yielded in the following TryGetNext
                     _valueOrEndPromise = CompilerImplementationDetails.s_completed;
@@ -194,7 +208,7 @@ public static class CompilerImplementationDetails
         public abstract void MoveNext();
 
         public int State; // -1 means not-yet-started, -2 means finished, even values correspond to 'await' states and odd values correspond to 'yield' states
-        private bool HasValue => State > 0 && (State & 1) != 0; // odd states have values from 'yield'
+        private bool IsYieldState => State > 0 && (State & 1) != 0; // odd states have values from 'yield'
 
         // current is used for 'yield' in the method body
         protected T _current; // only populated for states that have values
@@ -226,7 +240,7 @@ public static class CompilerImplementationDetails
                     {
                         return s_falseTask;
                     }
-                    else if (HasValue)
+                    else if (IsYieldState)
                     {
                         return s_trueTask;
                     }
@@ -247,7 +261,7 @@ public static class CompilerImplementationDetails
             {
                 // throw if state == -1 (you should call WaitForNextAsync first, ie. when in starting state)
                 // throw if state doesn't have value
-                if (State == -1 || !HasValue) throw new Exception("You should call WaitForNextAsync first");
+                if (State == -1 || !IsYieldState) throw new Exception("You should call WaitForNextAsync first");
 
                 // otherwise, call MoveNext (to get a value or a promise of one)
                 MoveNext();
@@ -262,7 +276,7 @@ public static class CompilerImplementationDetails
             }
 
             // if no promise, the machine is stopped and state has value, so return it (success)
-            Debug.Assert(HasValue);
+            Debug.Assert(IsYieldState);
             success = true;
             return _current;
         }
@@ -284,3 +298,14 @@ public interface IAsyncEnumerator<out T>
     Task<bool> WaitForNextAsync();
     T TryGetNext(out bool success);
 }
+
+// -2 is "no state" (not started or already finished)
+// -1 is initial state
+
+// Way to explain feature:
+//  General framing of async rewriting (code in state machine with handshakes)
+//  Foreach pattern
+//  Code example with annotations
+//  Logic for WaitForNext, TryGetNext
+//  Data stored in unpronouncable type
+//  Contract of MoveNext
