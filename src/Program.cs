@@ -138,10 +138,12 @@ class Program
 
                 if (_valueOrEndPromise != null)
                 {
+                    // reaching a `yield` following an `await`
                     _valueOrEndPromise.SetResult(true);
                 }
                 else if (previousState == -1)
                 {
+                    // reaching a `yield` from start
                     // If we came from the start, we'll pretend that the state machine ran.
                     // This way, the value will be properly yielded in the following TryGetNext
                     _valueOrEndPromise = CompilerImplementationDetails.s_completed;
