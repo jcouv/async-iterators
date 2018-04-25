@@ -109,18 +109,34 @@ class Program
             {
                 case -1:
                     // yield return 42;
-                    yieldReturn(42, state: 1);
-                    return;
-                case 1:
-                    // await Slow();
-                    awaitSlow(state: 2);
-                    // note: the machine is running in another thread, so we need to be very careful to just let it run (just return, don't touch anything)
+                    yieldReturn(42, state: 2);
                     return;
                 case 2:
-                    // yield return 43;
-                    yieldReturn(43, state: 3);
+                    // await Slow();
+                    awaitSlow(state: 3);
+                    // note: the machine is running in another thread, so we need to be very careful to just let it run (just return, don't touch anything)
                     return;
                 case 3:
+                    // yield return 43;
+                    yieldReturn(43, state: 5);
+                    return;
+                case 5:
+                    // yield return 44;
+                    yieldReturn(44, state: 6);
+                    return;
+                case 6:
+                    // await Done();
+                    awaitDone(state: 7);
+                    goto case 7;
+                case 7:
+                    // yield return 45;
+                    yieldReturn(45, state: 9);
+                    return;
+                case 9:
+                    // yield return 46;
+                    yieldReturn(46, state: 10);
+                    return;
+                case 10:
                     State = -2;
                     return;
             }
@@ -160,6 +176,13 @@ class Program
 
                 var self = this;
                 Builder.AwaitOnCompleted(ref Awaiter, ref self);
+            }
+
+            // await handshake (short-circuit):
+            void awaitDone(int state)
+            {
+                Task task = Task.CompletedTask;
+                State = state;
             }
         }
     }
