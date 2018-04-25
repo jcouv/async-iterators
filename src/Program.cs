@@ -1,5 +1,4 @@
 ﻿using System;
-using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 
@@ -7,8 +6,6 @@ using System.Threading.Tasks;
 //{
 //    async IAsyncEnumerable<int> Illustration()
 //    {
-//        // note: states are divided in two independent sequences: awaits (even), yields (odd)
-
 //        // call to WaitForNext will start all the code until state 1
 //        Console.Write("abc");
 //        await Slow(); // state 0, machine automatically continues
@@ -41,13 +38,6 @@ using System.Threading.Tasks;
 
 //    Task Slow() => throw null;
 //}
-
-// TODO: How to test all the possible transitions?
-// start
-// await
-// await-shortcut
-// yield
-// end
 
 class Program
 {
@@ -87,31 +77,29 @@ class Program
     // TODO what happens to exceptions? (should they bubble into value promise, or somewhere else?)
     private sealed class Unprounouncable : CompilerImplementationDetails.AsyncIteratorBase<int>
     {
-        // MoveNext returns with either:
+        // Constract: MoveNext returns with either:
         //  1. A promise of a future value (or finished state) that you can wait on
         //      - may already be completed (ie. reaching `yield` right from start)
-        //      - may not be completed (ie. reaching an `await`)
-        //  2. A state that has a value (or finished state). (no promise necessary since value available) (ie. `yield` after `yield`)
+        //      - may not be completed (ie. reaching an `await` that doesn't short-circuit). When the promise completes, the state machine will be stopped
+        //          on the end state or a `yield` state.
+        //  2. In end state
+        //  3. With a current value. (no promise necessary since value available) (ie. `yield` after `yield`)
         //
-        // When the promise completes, the state machine will be stopped on a `yield` state.
-        //
-        // await:
+        // await handshake:
         // get task and store it in awaiter (awaiter = task.GetAwaiter())
-        // if not already completed:
-        //	save locals,
-        //	set state to an even value,
-        //  initialize the promise of a value (the caller of MoveNext will be interested in that notification)
-        //	tell builder that we want a MoveNext callback after task/awaiter completes (using AwaitUnsafeOnCompleted),
+        // if the task is already completed, then just continue. Otherwise:
+        //  initialize the promise of a value
+        //	save locals, set state, tell builder that we want a MoveNext callback after task/awaiter completes (using AwaitUnsafeOnCompleted),
         //	return
         // note: this is what the async state machine does today, except for initializing the promise of a value
         //
-        // yield:
+        // yield handshake:
         // set current,
         // set state,
         // if someone was promised a value, complete promise with true (value found)
         // return
         //
-        // end:
+        // end handshake:
         // set state (finished)
         // if someone was promised a value, set it to done and false (finished state)
         // return
@@ -126,7 +114,7 @@ class Program
                 case 1:
                     // await Slow();
                     awaitSlow(state: 2);
-                    // note: the machine is running in another thread, so we need to be very careful to just let it run (don't look, don't touch)
+                    // note: the machine is running in another thread, so we need to be very careful to just let it run (just return, don't touch anything)
                     return;
                 case 2:
                     // yield return 43;
@@ -137,13 +125,9 @@ class Program
                     return;
             }
 
+            // yield handshake:
             void yieldReturn(int value, int state)
             {
-                // yield:
-                // set current,
-                // set state,
-                // if someone was promised a value, complete promise with true (value found)
-                // return
                 _current = value;
 
                 int previousState = State;
@@ -165,22 +149,11 @@ class Program
                 }
             }
 
+            // await handshake:
             void awaitSlow(int state)
             {
-                // await:
-                // get task and store it in awaiter (awaiter = task.GetAwaiter())
-                // if not already completed:
-                //	save locals,
-                //	set state to an even value,
-                //  initialize the promise of a value (the caller of MoveNext will be interested in that notification)
-                //	tell builder that we want a MoveNext callback after task/awaiter completes (using AwaitUnsafeOnCompleted),
-                //	return
-                // note: this is what the async state machine does today, except for initializing the promise of a value
-
                 Task task = Task.Delay(100);
                 this.Awaiter = task.GetAwaiter();
-
-                Debug.Assert((state & 1) == 0); // even states for 'await'
                 State = state;
 
                 _valueOrEndPromise = new TaskCompletionSource<bool>(); // <--- Could we avoid allocation?
@@ -194,7 +167,7 @@ class Program
 
 public static class CompilerImplementationDetails
 {
-    // Is there a good place to store these?
+    // TODO: Is there a good place to store these?
     internal static readonly Task<bool> s_falseTask = Task.FromResult(false);
     internal static readonly Task<bool> s_trueTask = Task.FromResult(true);
 
@@ -210,17 +183,15 @@ public static class CompilerImplementationDetails
     {
         public abstract void MoveNext();
 
-        public int State; // -1 means not-yet-started, -2 means finished
+        public int State; // -1 means not-yet-started, -2 means finished (TODO: confirm -1)
 
-        // current is used for 'yield' in the method body
-        protected T _current; // only populated for states that have values
+        protected T _current;
 
         // awaiter and builder are used for 'await' in the method body
         public TaskAwaiter Awaiter; // thin wrapper around a Task (that we'll be waiting on) <-- Not sure why we need to store this
         public AsyncTaskMethodBuilder<int> Builder; // used for getting a callback to MoveNext when async code completes
 
         // If the promise is set, then don't check the machine state from code that isn't actively running the machine. The machine may be running on another thread.
-        // The promise being set and completed signals there is a value that has not yet been yielded.
         protected TaskCompletionSource<bool> _valueOrEndPromise; // promise for a value or end (true means value found, false means finished state)
 
         // Contract: WaitForNextAsync will either return a false (no value left) or a true (found a value) with the promise set (to signal an unreturned value is stored).
@@ -263,12 +234,11 @@ public static class CompilerImplementationDetails
                 // throw if state == -1 (you should call WaitForNextAsync first, ie. when in starting state)
                 if (State == -1) throw new Exception("You should call WaitForNextAsync first");
 
-                // otherwise, call MoveNext (to get a value or a promise of one)
+                // otherwise, call MoveNext to get a value or a promise of one
                 MoveNext();
+                // MoveNext always returns with a promise of a future value, reaching end state, or an immediately available value
             }
 
-            // if we have a promise, no point in checking the state, MoveNext made the machine run. WaitForNext will pick up the result (no value available immediately)
-            // if no promise, but reached last state, then no values to return (ever)
             if (_valueOrEndPromise != null || State == -2)
             {
                 success = false;
@@ -308,3 +278,12 @@ public interface IAsyncEnumerator<out T>
 //  Logic for WaitForNext, TryGetNext
 //  Data stored in unpronouncable type
 //  Contract of MoveNext
+
+
+// TODO: How to test all the possible transitions?
+// start
+// await
+// await-shortcut
+// yield
+// end
+
