@@ -137,7 +137,7 @@ class Program
                     yieldReturn(46, state: 10);
                     return;
                 case 10:
-                    State = -2;
+                    end();
                     return;
             }
 
@@ -183,6 +183,15 @@ class Program
             {
                 Task task = Task.CompletedTask;
                 State = state;
+            }
+
+            void end()
+            {
+                State = -2;
+                if (_valueOrEndPromise != null)
+                {
+                    _valueOrEndPromise.SetResult(false);
+                }
             }
         }
     }
