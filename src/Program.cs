@@ -67,7 +67,7 @@ class Program
     static IAsyncEnumerable<int> AsyncIterator()
     {
         var stateMachine = new Unprounouncable();
-        stateMachine.State = -1; // TODO: should state be -2 ?
+        stateMachine.State = -1; // TODO: should state be -2 ? -1 may be "running"
         stateMachine.Builder = AsyncTaskMethodBuilder<int>.Create();
         // note: we don't start the machine.
         return stateMachine;
