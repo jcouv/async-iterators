@@ -68,7 +68,7 @@ class Program
     {
         var stateMachine = new Unprounouncable();
         stateMachine.State = -1; // TODO: should state be -2 ? -1 may be "running"
-        stateMachine.Builder = AsyncTaskMethodBuilder<int>.Create();
+        stateMachine.Builder = AsyncTaskMethodBuilder.Create();
         // note: we don't start the machine.
         return stateMachine;
     }
@@ -172,7 +172,10 @@ class Program
                 this.Awaiter = task.GetAwaiter();
                 State = state;
 
-                _valueOrEndPromise = new TaskCompletionSource<bool>(); // <--- Could we avoid allocation?
+                if (_valueOrEndPromise == null)
+                {
+                    _valueOrEndPromise = new TaskCompletionSource<bool>(); // <--- Could we avoid allocation?
+                }
 
                 var self = this;
                 Builder.AwaitOnCompleted(ref Awaiter, ref self);
@@ -221,7 +224,7 @@ public static class CompilerImplementationDetails
 
         // awaiter and builder are used for 'await' in the method body
         public TaskAwaiter Awaiter; // thin wrapper around a Task (that we'll be waiting on) <-- Not sure why we need to store this
-        public AsyncTaskMethodBuilder<int> Builder; // used for getting a callback to MoveNext when async code completes
+        public AsyncTaskMethodBuilder Builder; // used for getting a callback to MoveNext when async code completes
 
         // If the promise is set, then don't check the machine state from code that isn't actively running the machine. The machine may be running on another thread.
         protected TaskCompletionSource<bool> _valueOrEndPromise; // promise for a value or end (true means value found, false means finished state)
