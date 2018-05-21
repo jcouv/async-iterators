@@ -46,7 +46,6 @@ class Program
         IAsyncEnumerable<int> test = AsyncIterator();
         IAsyncEnumerator<int> enumerable = test.GetAsyncEnumerator();
 
-        // TODO: do we need the inner loop?
         //foreach await (var value in enumerable)
         //{
         //    Console.WriteLine(value)
@@ -75,9 +74,19 @@ class Program
 
     // TODO cancellation token
     // TODO what happens to exceptions? (should they bubble into value promise, or somewhere else?)
-    private sealed class Unprounouncable : CompilerImplementationDetails.AsyncIteratorBase<int>
+    private sealed class Unprounouncable : IAsyncStateMachine, IAsyncEnumerable<int>, IAsyncEnumerator<int>
     {
-        // Constract: MoveNext returns with either:
+        public int State; // -1 means not-yet-started, -2 means finished (TODO: confirm -1)
+
+        // awaiter and builder are used for 'await' in the method body
+        public TaskAwaiter Awaiter; // thin wrapper around a Task (that we'll be waiting on) <-- Not sure why we need to store this
+        public AsyncTaskMethodBuilder Builder; // used for getting a callback to MoveNext when async code completes
+
+        private int _current;
+
+        // If the promise is set, then don't check the machine state from code that isn't actively running the machine. The machine may be running on another thread.
+        private TaskCompletionSource<bool> _valueOrEndPromise; // promise for a value or end (true means value found, false means finished state)
+        // Contract: MoveNext returns with either:
         //  1. A promise of a future value (or finished state) that you can wait on
         //      - may already be completed (ie. reaching `yield` right from start)
         //      - may not be completed (ie. reaching an `await` that doesn't short-circuit). When the promise completes, the state machine will be stopped
@@ -103,7 +112,7 @@ class Program
         // set state (finished)
         // if someone was promised a value, set it to done and false (finished state)
         // return
-        public override void MoveNext()
+        public void MoveNext()
         {
             switch (State)
             {
@@ -117,6 +126,11 @@ class Program
                     // note: the machine is running in another thread, so we need to be very careful to just let it run (just return, don't touch anything)
                     return;
                 case 3:
+                    // await Slow();
+                    awaitSlow(state: 4);
+                    // note: the machine is running in another thread, so we need to be very careful to just let it run (just return, don't touch anything)
+                    return;
+                case 4:
                     // yield return 43;
                     yieldReturn(43, state: 5);
                     return;
@@ -197,37 +211,6 @@ class Program
                 }
             }
         }
-    }
-}
-
-public static class CompilerImplementationDetails
-{
-    // TODO: Is there a good place to store these?
-    internal static readonly Task<bool> s_falseTask = Task.FromResult(false);
-    internal static readonly Task<bool> s_trueTask = Task.FromResult(true);
-
-    internal static TaskCompletionSource<bool> s_completed;
-
-    static CompilerImplementationDetails()
-    {
-        s_completed = new TaskCompletionSource<bool>();
-        s_completed.SetResult(true);
-    }
-
-    public abstract class AsyncIteratorBase<T> : IAsyncStateMachine, IAsyncEnumerable<T>, IAsyncEnumerator<T>
-    {
-        public abstract void MoveNext();
-
-        public int State; // -1 means not-yet-started, -2 means finished (TODO: confirm -1)
-
-        protected T _current;
-
-        // awaiter and builder are used for 'await' in the method body
-        public TaskAwaiter Awaiter; // thin wrapper around a Task (that we'll be waiting on) <-- Not sure why we need to store this
-        public AsyncTaskMethodBuilder Builder; // used for getting a callback to MoveNext when async code completes
-
-        // If the promise is set, then don't check the machine state from code that isn't actively running the machine. The machine may be running on another thread.
-        protected TaskCompletionSource<bool> _valueOrEndPromise; // promise for a value or end (true means value found, false means finished state)
 
         // Contract: WaitForNextAsync will either return a false (no value left) or a true (found a value) with the promise set (to signal an unreturned value is stored).
         public Task<bool> WaitForNextAsync()
@@ -238,7 +221,7 @@ public static class CompilerImplementationDetails
             {
                 if (State == -2)
                 {
-                    return s_falseTask;
+                    return CompilerImplementationDetails.s_falseTask;
                 }
 
                 MoveNext();
@@ -247,17 +230,17 @@ public static class CompilerImplementationDetails
                 {
                     if (State == -2)
                     {
-                        return s_falseTask;
+                        return CompilerImplementationDetails.s_falseTask;
                     }
 
-                    return s_trueTask;
+                    return CompilerImplementationDetails.s_trueTask;
                 }
             }
 
             return _valueOrEndPromise.Task;
         }
 
-        public T TryGetNext(out bool success)
+        public int TryGetNext(out bool success)
         {
             if (_valueOrEndPromise != null)
             {
@@ -288,7 +271,22 @@ public static class CompilerImplementationDetails
         public void SetStateMachine(IAsyncStateMachine stateMachine) { }
 
         // TODO when can we re-use this, and when should we create a new instance?
-        public IAsyncEnumerator<T> GetAsyncEnumerator() => this;
+        public IAsyncEnumerator<int> GetAsyncEnumerator() => this;
+    }
+}
+
+public static class CompilerImplementationDetails
+{
+    // TODO: Is there a good place to store these?
+    internal static readonly Task<bool> s_falseTask = Task.FromResult(false);
+    internal static readonly Task<bool> s_trueTask = Task.FromResult(true);
+
+    internal static TaskCompletionSource<bool> s_completed;
+
+    static CompilerImplementationDetails()
+    {
+        s_completed = new TaskCompletionSource<bool>();
+        s_completed.SetResult(true);
     }
 }
 
