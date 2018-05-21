@@ -78,8 +78,7 @@ class Program
         return stateMachine;
     }
 
-    // TODO cancellation token
-    // TODO what happens to exceptions? (should they bubble into value promise, or somewhere else?)
+    // TODO what happens to exceptions? (should they bubble into value promise, or anywhere else?)
     private sealed class Unprounouncable :
         IAsyncStateMachine,
         IAsyncEnumerable<int>,
@@ -87,6 +86,7 @@ class Program
         IValueTaskSource<bool>, // used as the backing store behind the ValueTask<bool> returned from each MoveNextAsync
         IStrongBox<ManualResetValueTaskSourceLogic<bool>> // exposes its ValueTaskSource logic implementation
     {
+        // If the promise is set (ie. _promiseIsActive is true), then don't check the machine state from code that isn't actively running the machine. The machine may be running on another thread.
         public int State; // -1 means not-yet-started, -2 means finished (TODO: confirm -1)
 
         // awaiter and builder are used for 'await' in the method body
@@ -95,10 +95,20 @@ class Program
 
         private int _current;
 
-        // If the promise is set, then don't check the machine state from code that isn't actively running the machine. The machine may be running on another thread.
+        #region promise
         /// <summary>All of the logic for managing the IValueTaskSource implementation.</summary>
         public ManualResetValueTaskSourceLogic<bool> _valueOrEndPromise; // promise for a value or end (true means value found, false means finished state)
         private bool _promiseIsActive = false; // this is spiritually equivalent to saying the promise is set versus null
+
+        ref ManualResetValueTaskSourceLogic<bool> IStrongBox<ManualResetValueTaskSourceLogic<bool>>.Value
+            => ref _valueOrEndPromise;
+        ValueTaskSourceStatus IValueTaskSource<bool>.GetStatus(short token)
+            => _valueOrEndPromise.GetStatus(token);
+        void IValueTaskSource<bool>.OnCompleted(Action<object> continuation, object state, short token, ValueTaskSourceOnCompletedFlags flags)
+            => _valueOrEndPromise.OnCompleted(continuation, state, token, flags);
+        bool IValueTaskSource<bool>.GetResult(short token)
+            => _valueOrEndPromise.GetResult(token);
+        #endregion
 
         // Contract: MoveNext returns with either:
         //  1. A promise of a future value (or finished state) that you can wait on (ie. _promiseIsActive is true)
@@ -222,12 +232,6 @@ class Program
             }
         }
 
-        /// <summary>
-        /// Only check this if promise is active.
-        /// </summary>
-        private bool IsPromisePending
-            => _valueOrEndPromise.GetStatus(_valueOrEndPromise.Version) == ValueTaskSourceStatus.Pending;
-
         // PROTOTYPE(async-streams): update interface definition and async-foreach should recognize task-like in pattern
         // Contract: WaitForNextAsync will either return a false (no value left) or a true (found a value) with the promise set (to signal an unreturned value is stored).
         public ValueTask<bool> WaitForNextAsync()
@@ -262,7 +266,6 @@ class Program
         {
             if (_promiseIsActive)
             {
-                Debug.Assert(!this.IsPromisePending);
                 // if this is the first TryGetNext call after WaitForNext, then we'll return the value we already have
                 _promiseIsActive = false; // clear the promise, so that the next call to TryGetNext can move forward
             }
@@ -276,7 +279,7 @@ class Program
                 // MoveNext always returns with a promise of a future value, reaching end state, or an immediately available value
             }
 
-            if ((_promiseIsActive && this.IsPromisePending) || State == -2)
+            if (_promiseIsActive || State == -2)
             {
                 success = false;
                 return default;
@@ -293,17 +296,6 @@ class Program
         // TODO when can we re-use this, and when should we create a new instance?
         public IAsyncEnumerator<int> GetAsyncEnumerator()
             => this;
-
-        public ref ManualResetValueTaskSourceLogic<bool> Value => ref _valueOrEndPromise;
-
-        public bool GetResult(short token)
-            => _valueOrEndPromise.GetResult(token);
-
-        public ValueTaskSourceStatus GetStatus(short token)
-            => _valueOrEndPromise.GetStatus(token);
-
-        public void OnCompleted(Action<object> continuation, object state, short token, ValueTaskSourceOnCompletedFlags flags)
-            => _valueOrEndPromise.OnCompleted(continuation, state, token, flags);
     }
 }
 
