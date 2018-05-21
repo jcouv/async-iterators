@@ -1,6 +1,10 @@
 ﻿using System;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
+using System.Threading;
 using System.Threading.Tasks;
+using System.Threading.Tasks.Sources;
 
 //class Doc
 //{
@@ -68,13 +72,20 @@ class Program
         var stateMachine = new Unprounouncable();
         stateMachine.State = -1; // TODO: should state be -2 ? -1 may be "running"
         stateMachine.Builder = AsyncTaskMethodBuilder.Create();
+        stateMachine._valueOrEndPromise = new ManualResetValueTaskSourceLogic<bool>(stateMachine);
+
         // note: we don't start the machine.
         return stateMachine;
     }
 
     // TODO cancellation token
     // TODO what happens to exceptions? (should they bubble into value promise, or somewhere else?)
-    private sealed class Unprounouncable : IAsyncStateMachine, IAsyncEnumerable<int>, IAsyncEnumerator<int>
+    private sealed class Unprounouncable :
+        IAsyncStateMachine,
+        IAsyncEnumerable<int>,
+        IAsyncEnumerator<int>,
+        IValueTaskSource<bool>, // used as the backing store behind the ValueTask<bool> returned from each MoveNextAsync
+        IStrongBox<ManualResetValueTaskSourceLogic<bool>> // exposes its ValueTaskSource logic implementation
     {
         public int State; // -1 means not-yet-started, -2 means finished (TODO: confirm -1)
 
@@ -85,19 +96,22 @@ class Program
         private int _current;
 
         // If the promise is set, then don't check the machine state from code that isn't actively running the machine. The machine may be running on another thread.
-        private TaskCompletionSource<bool> _valueOrEndPromise; // promise for a value or end (true means value found, false means finished state)
+        /// <summary>All of the logic for managing the IValueTaskSource implementation.</summary>
+        public ManualResetValueTaskSourceLogic<bool> _valueOrEndPromise; // promise for a value or end (true means value found, false means finished state)
+        private bool _promiseIsActive = false; // this is spiritually equivalent to saying the promise is set versus null
+
         // Contract: MoveNext returns with either:
-        //  1. A promise of a future value (or finished state) that you can wait on
+        //  1. A promise of a future value (or finished state) that you can wait on (ie. _promiseIsActive is true)
         //      - may already be completed (ie. reaching `yield` right from start)
-        //      - may not be completed (ie. reaching an `await` that doesn't short-circuit). When the promise completes, the state machine will be stopped
+        //      - may be pending (ie. reaching an `await` that doesn't short-circuit). When the promise completes, the state machine will be stopped
         //          on the end state or a `yield` state.
         //  2. In end state
         //  3. With a current value. (no promise necessary since value available) (ie. `yield` after `yield`)
         //
         // await handshake:
         // get task and store it in awaiter (awaiter = task.GetAwaiter())
-        // if the task is already completed, then just continue. Otherwise:
-        //  initialize the promise of a value
+        // if the task is already completed, then just continue (short-circuit). Otherwise:
+        //  initialize the promise of a value (with _promiseIsActive = true, and _valueOrEndPromise.Reset())
         //	save locals, set state, tell builder that we want a MoveNext callback after task/awaiter completes (using AwaitUnsafeOnCompleted),
         //	return
         // note: this is what the async state machine does today, except for initializing the promise of a value
@@ -122,12 +136,12 @@ class Program
                     return;
                 case 2:
                     // await Slow();
-                    awaitSlow(state: 3);
+                    awaitExpr(state: 3, fast: false);
                     // note: the machine is running in another thread, so we need to be very careful to just let it run (just return, don't touch anything)
                     return;
                 case 3:
                     // await Slow();
-                    awaitSlow(state: 4);
+                    awaitExpr(state: 4, fast: false);
                     // note: the machine is running in another thread, so we need to be very careful to just let it run (just return, don't touch anything)
                     return;
                 case 4:
@@ -140,7 +154,7 @@ class Program
                     return;
                 case 6:
                     // await Done();
-                    awaitDone(state: 7);
+                    awaitExpr(state: 7, fast: true);
                     goto case 7;
                 case 7:
                     // yield return 45;
@@ -163,7 +177,7 @@ class Program
                 int previousState = State;
                 State = state;
 
-                if (_valueOrEndPromise != null)
+                if (this._promiseIsActive)
                 {
                     // reaching a `yield` following an `await`
                     _valueOrEndPromise.SetResult(true);
@@ -175,77 +189,82 @@ class Program
                     // reaching a `yield` from start
                     // If we came from the start, we'll pretend that the state machine ran.
                     // This way, the value will be properly yielded in the following TryGetNext
-                    _valueOrEndPromise = CompilerImplementationDetails.s_completed;
+                    _promiseIsActive = true;
+                    _valueOrEndPromise.SetResult(true);
                 }
             }
 
             // await handshake:
-            void awaitSlow(int state)
+            void awaitExpr(int state, bool fast)
             {
-                Task task = Task.Delay(100);
+                Task task = fast ? Task.CompletedTask : Task.Delay(100);
                 this.Awaiter = task.GetAwaiter();
                 State = state;
-
-                if (_valueOrEndPromise == null)
+                if (!task.IsCompleted)
                 {
-                    _valueOrEndPromise = new TaskCompletionSource<bool>(); // <--- Could we avoid allocation?
+                    if (!this._promiseIsActive)
+                    {
+                        _promiseIsActive = true;
+                        _valueOrEndPromise.Reset();
+                    }
+                    var self = this;
+                    Builder.AwaitOnCompleted(ref Awaiter, ref self);
                 }
-
-                var self = this;
-                Builder.AwaitOnCompleted(ref Awaiter, ref self);
-            }
-
-            // await handshake (short-circuit):
-            void awaitDone(int state)
-            {
-                Task task = Task.CompletedTask;
-                State = state;
             }
 
             void end()
             {
                 State = -2;
-                if (_valueOrEndPromise != null)
+                if (_promiseIsActive)
                 {
                     _valueOrEndPromise.SetResult(false);
                 }
             }
         }
 
+        /// <summary>
+        /// Only check this if promise is active.
+        /// </summary>
+        private bool IsPromisePending
+            => _valueOrEndPromise.GetStatus(_valueOrEndPromise.Version) == ValueTaskSourceStatus.Pending;
+
+        // PROTOTYPE(async-streams): update interface definition and async-foreach should recognize task-like in pattern
         // Contract: WaitForNextAsync will either return a false (no value left) or a true (found a value) with the promise set (to signal an unreturned value is stored).
-        public Task<bool> WaitForNextAsync()
+        public ValueTask<bool> WaitForNextAsync()
         {
-            // if we have a promise stored already (ie. the async code was started by last TryGetNext), then we will use it
-            // if we don't have a promise stored already, then call MoveNext()
-            if (_valueOrEndPromise is null)
+            // PROTOTYPE(async-streams)
+            // if we have a pending promise already (ie. the async code was started by last TryGetNext), then we will use it
+            // if we don't have a pending promise, then call MoveNext()
+            if (!this._promiseIsActive)
             {
+                // PROTOTYPE(async-streams): I don't think we need this check anymore. The state machine should SetResult(false) when reaching end state.
                 if (State == -2)
                 {
-                    return CompilerImplementationDetails.s_falseTask;
+                    return new ValueTask<bool>(false);
                 }
 
                 MoveNext();
                 // MoveNext always returns with a promise of a future value, reaching end state, or an immediately available value
-                if (_valueOrEndPromise is null)
-                {
-                    if (State == -2)
-                    {
-                        return CompilerImplementationDetails.s_falseTask;
-                    }
 
-                    return CompilerImplementationDetails.s_trueTask;
+                if (!this._promiseIsActive)
+                {
+                    return new ValueTask<bool>(State != 2);
                 }
             }
 
-            return _valueOrEndPromise.Task;
+            return new ValueTask<bool>(this, _valueOrEndPromise.Version);
         }
 
+        /// <summary>
+        /// You should only call this method once the promise from WaitForNextAsync completed with true.
+        /// </summary>
         public int TryGetNext(out bool success)
         {
-            if (_valueOrEndPromise != null)
+            if (_promiseIsActive)
             {
+                Debug.Assert(!this.IsPromisePending);
                 // if this is the first TryGetNext call after WaitForNext, then we'll return the value we already have
-                _valueOrEndPromise = null; // clear the promise, so that the next call to TryGetNext can move forward
+                _promiseIsActive = false; // clear the promise, so that the next call to TryGetNext can move forward
             }
             else
             {
@@ -257,13 +276,14 @@ class Program
                 // MoveNext always returns with a promise of a future value, reaching end state, or an immediately available value
             }
 
-            if (_valueOrEndPromise != null || State == -2)
+            if ((_promiseIsActive && this.IsPromisePending) || State == -2)
             {
                 success = false;
                 return default;
             }
 
-            // if no promise, the machine is stopped and state has value, so return it (success)
+            // PROTOTYPE(async-streams): what if the promise is failed or cancelled?
+            // the machine is stopped and state has value, so return it (success)
             success = true;
             return _current;
         }
@@ -271,25 +291,226 @@ class Program
         public void SetStateMachine(IAsyncStateMachine stateMachine) { }
 
         // TODO when can we re-use this, and when should we create a new instance?
-        public IAsyncEnumerator<int> GetAsyncEnumerator() => this;
+        public IAsyncEnumerator<int> GetAsyncEnumerator()
+            => this;
+
+        public ref ManualResetValueTaskSourceLogic<bool> Value => ref _valueOrEndPromise;
+
+        public bool GetResult(short token)
+            => _valueOrEndPromise.GetResult(token);
+
+        public ValueTaskSourceStatus GetStatus(short token)
+            => _valueOrEndPromise.GetStatus(token);
+
+        public void OnCompleted(Action<object> continuation, object state, short token, ValueTaskSourceOnCompletedFlags flags)
+            => _valueOrEndPromise.OnCompleted(continuation, state, token, flags);
     }
 }
 
-public static class CompilerImplementationDetails
+// PROTOTYPE(async-streams): Figure how to get this type
+namespace System.Runtime.CompilerServices
 {
-    // TODO: Is there a good place to store these?
-    internal static readonly Task<bool> s_falseTask = Task.FromResult(false);
-    internal static readonly Task<bool> s_trueTask = Task.FromResult(true);
-
-    internal static TaskCompletionSource<bool> s_completed;
-
-    static CompilerImplementationDetails()
+    public interface IStrongBox<T>
     {
-        s_completed = new TaskCompletionSource<bool>();
-        s_completed.SetResult(true);
+        ref T Value { get; }
     }
 }
 
+// PROTOTYPE(async-streams): Figure how to get this type
+public struct ManualResetValueTaskSourceLogic<TResult>
+{
+    private static readonly Action<object> s_sentinel = new Action<object>(s => throw new InvalidOperationException());
+
+    private readonly IStrongBox<ManualResetValueTaskSourceLogic<TResult>> _parent;
+    private Action<object> _continuation;
+    private object _continuationState;
+    private object _capturedContext;
+    private ExecutionContext _executionContext;
+    private bool _completed;
+    private TResult _result;
+    private ExceptionDispatchInfo _error;
+    private short _version;
+
+    public ManualResetValueTaskSourceLogic(IStrongBox<ManualResetValueTaskSourceLogic<TResult>> parent)
+    {
+        _parent = parent ?? throw new ArgumentNullException(nameof(parent));
+        _continuation = null;
+        _continuationState = null;
+        _capturedContext = null;
+        _executionContext = null;
+        _completed = false;
+        _result = default;
+        _error = null;
+        _version = 0;
+    }
+
+    public short Version => _version;
+
+    private void ValidateToken(short token)
+    {
+        if (token != _version)
+        {
+            throw new InvalidOperationException();
+        }
+    }
+
+    public ValueTaskSourceStatus GetStatus(short token)
+    {
+        ValidateToken(token);
+
+        return
+            !_completed ? ValueTaskSourceStatus.Pending :
+            _error == null ? ValueTaskSourceStatus.Succeeded :
+            _error.SourceException is OperationCanceledException ? ValueTaskSourceStatus.Canceled :
+            ValueTaskSourceStatus.Faulted;
+    }
+
+    public TResult GetResult(short token)
+    {
+        ValidateToken(token);
+
+        if (!_completed)
+        {
+            throw new InvalidOperationException();
+        }
+
+        _error?.Throw();
+        return _result;
+    }
+
+    public void Reset()
+    {
+        _version++;
+
+        _completed = false;
+        _continuation = null;
+        _continuationState = null;
+        _result = default;
+        _error = null;
+        _executionContext = null;
+        _capturedContext = null;
+    }
+
+    public void OnCompleted(Action<object> continuation, object state, short token, ValueTaskSourceOnCompletedFlags flags)
+    {
+        if (continuation == null)
+        {
+            throw new ArgumentNullException(nameof(continuation));
+        }
+        ValidateToken(token);
+
+        if ((flags & ValueTaskSourceOnCompletedFlags.FlowExecutionContext) != 0)
+        {
+            _executionContext = ExecutionContext.Capture();
+        }
+
+        if ((flags & ValueTaskSourceOnCompletedFlags.UseSchedulingContext) != 0)
+        {
+            SynchronizationContext sc = SynchronizationContext.Current;
+            if (sc != null && sc.GetType() != typeof(SynchronizationContext))
+            {
+                _capturedContext = sc;
+            }
+            else
+            {
+                TaskScheduler ts = TaskScheduler.Current;
+                if (ts != TaskScheduler.Default)
+                {
+                    _capturedContext = ts;
+                }
+            }
+        }
+
+        _continuationState = state;
+        if (Interlocked.CompareExchange(ref _continuation, continuation, null) != null)
+        {
+            _executionContext = null;
+
+            object cc = _capturedContext;
+            _capturedContext = null;
+
+            switch (cc)
+            {
+                case null:
+                    Task.Factory.StartNew(continuation, state, CancellationToken.None, TaskCreationOptions.DenyChildAttach, TaskScheduler.Default);
+                    break;
+
+                case SynchronizationContext sc:
+                    sc.Post(s =>
+                    {
+                        var tuple = (Tuple<Action<object>, object>)s;
+                        tuple.Item1(tuple.Item2);
+                    }, Tuple.Create(continuation, state));
+                    break;
+
+                case TaskScheduler ts:
+                    Task.Factory.StartNew(continuation, state, CancellationToken.None, TaskCreationOptions.DenyChildAttach, ts);
+                    break;
+            }
+        }
+    }
+
+    public void SetResult(TResult result)
+    {
+        _result = result;
+        SignalCompletion();
+    }
+
+    public void SetException(Exception error)
+    {
+        _error = ExceptionDispatchInfo.Capture(error);
+        SignalCompletion();
+    }
+
+    private void SignalCompletion()
+    {
+        if (_completed)
+        {
+            throw new InvalidOperationException();
+        }
+        _completed = true;
+
+        if (Interlocked.CompareExchange(ref _continuation, s_sentinel, null) != null)
+        {
+            if (_executionContext != null)
+            {
+                ExecutionContext.Run(
+                    _executionContext,
+                    s => ((IStrongBox<ManualResetValueTaskSourceLogic<TResult>>)s).Value.InvokeContinuation(),
+                    _parent ?? throw new InvalidOperationException());
+            }
+            else
+            {
+                InvokeContinuation();
+            }
+        }
+    }
+
+    private void InvokeContinuation()
+    {
+        object cc = _capturedContext;
+        _capturedContext = null;
+
+        switch (cc)
+        {
+            case null:
+                _continuation(_continuationState);
+                break;
+
+            case SynchronizationContext sc:
+                sc.Post(s =>
+                {
+                    ref ManualResetValueTaskSourceLogic<TResult> logicRef = ref ((IStrongBox<ManualResetValueTaskSourceLogic<TResult>>)s).Value;
+                    logicRef._continuation(logicRef._continuationState);
+                }, _parent ?? throw new InvalidOperationException());
+                break;
+
+            case TaskScheduler ts:
+                Task.Factory.StartNew(_continuation, _continuationState, CancellationToken.None, TaskCreationOptions.DenyChildAttach, ts);
+                break;
+        }
+    }
+}
 public interface IAsyncEnumerable<out T>
 {
     IAsyncEnumerator<T> GetAsyncEnumerator();
@@ -297,7 +518,7 @@ public interface IAsyncEnumerable<out T>
 
 public interface IAsyncEnumerator<out T>
 {
-    Task<bool> WaitForNextAsync();
+    ValueTask<bool> WaitForNextAsync();
     T TryGetNext(out bool success);
 }
 
