@@ -70,9 +70,10 @@ class Program
     static IAsyncEnumerable<int> AsyncIterator()
     {
         var stateMachine = new Unprounouncable();
-        stateMachine.State = -1; // TODO: should state be -2 ? -1 may be "running"
+        stateMachine.State = StateMachineStates.NotStartedStateMachine;
         stateMachine.Builder = AsyncTaskMethodBuilder.Create();
         stateMachine._valueOrEndPromise = new ManualResetValueTaskSourceLogic<bool>(stateMachine);
+        stateMachine._promiseIsActive = true;
 
         // note: we don't start the machine.
         return stateMachine;
@@ -87,7 +88,7 @@ class Program
         IStrongBox<ManualResetValueTaskSourceLogic<bool>> // exposes its ValueTaskSource logic implementation
     {
         // If the promise is set (ie. _promiseIsActive is true), then don't check the machine state from code that isn't actively running the machine. The machine may be running on another thread.
-        public int State; // -1 means not-yet-started, -2 means finished (TODO: confirm -1)
+        public int State;
 
         // awaiter and builder are used for 'await' in the method body
         public TaskAwaiter Awaiter; // thin wrapper around a Task (that we'll be waiting on) <-- Not sure why we need to store this
@@ -98,7 +99,7 @@ class Program
         #region promise
         /// <summary>All of the logic for managing the IValueTaskSource implementation.</summary>
         public ManualResetValueTaskSourceLogic<bool> _valueOrEndPromise; // promise for a value or end (true means value found, false means finished state)
-        private bool _promiseIsActive = false; // this is spiritually equivalent to saying the promise is set versus null
+        public bool _promiseIsActive = false; // this is spiritually equivalent to saying the promise is set versus null
 
         ref ManualResetValueTaskSourceLogic<bool> IStrongBox<ManualResetValueTaskSourceLogic<bool>>.Value
             => ref _valueOrEndPromise;
@@ -140,7 +141,7 @@ class Program
         {
             switch (State)
             {
-                case -1:
+                case StateMachineStates.NotStartedStateMachine:
                     // yield return 42;
                     yieldReturn(42, state: 2);
                     return;
@@ -189,17 +190,7 @@ class Program
 
                 if (this._promiseIsActive)
                 {
-                    // reaching a `yield` following an `await`
-                    _valueOrEndPromise.SetResult(true);
-                }
-                else if (previousState == -1)
-                {
-                    // TODO: what if we came from a short-circuited await?
-
-                    // reaching a `yield` from start
-                    // If we came from the start, we'll pretend that the state machine ran.
-                    // This way, the value will be properly yielded in the following TryGetNext
-                    _promiseIsActive = true;
+                    // reaching a `yield` following an `await` or directly from start
                     _valueOrEndPromise.SetResult(true);
                 }
             }
@@ -224,11 +215,13 @@ class Program
 
             void end()
             {
-                State = -2;
-                if (_promiseIsActive)
+                State = StateMachineStates.FinishedStateMachine;
+                if (!_promiseIsActive)
                 {
-                    _valueOrEndPromise.SetResult(false);
+                    _promiseIsActive = true;
+                    _valueOrEndPromise.Reset();
                 }
+                _valueOrEndPromise.SetResult(false);
             }
         }
 
@@ -239,21 +232,11 @@ class Program
             // PROTOTYPE(async-streams)
             // if we have a pending promise already (ie. the async code was started by last TryGetNext), then we will use it
             // if we don't have a pending promise, then call MoveNext()
-            if (!this._promiseIsActive)
+            if (!this._promiseIsActive || State == StateMachineStates.NotStartedStateMachine)
             {
                 // PROTOTYPE(async-streams): I don't think we need this check anymore. The state machine should SetResult(false) when reaching end state.
-                if (State == -2)
-                {
-                    return new ValueTask<bool>(false);
-                }
-
                 MoveNext();
                 // MoveNext always returns with a promise of a future value, reaching end state, or an immediately available value
-
-                if (!this._promiseIsActive)
-                {
-                    return new ValueTask<bool>(State != 2);
-                }
             }
 
             return new ValueTask<bool>(this, _valueOrEndPromise.Version);
@@ -266,20 +249,23 @@ class Program
         {
             if (_promiseIsActive)
             {
+                // throw if you call TryGetNext before WaitForNextAsync allowed you to
+                if (_valueOrEndPromise.GetStatus(_valueOrEndPromise.Version) == ValueTaskSourceStatus.Pending) throw new Exception();
+
+                // throw if state == -1 (you should call WaitForNextAsync first, ie. when in starting state)
+                if (State == StateMachineStates.NotStartedStateMachine) throw new Exception("You should call WaitForNextAsync first");
+
                 // if this is the first TryGetNext call after WaitForNext, then we'll return the value we already have
                 _promiseIsActive = false; // clear the promise, so that the next call to TryGetNext can move forward
             }
             else
             {
-                // throw if state == -1 (you should call WaitForNextAsync first, ie. when in starting state)
-                if (State == -1) throw new Exception("You should call WaitForNextAsync first");
-
                 // otherwise, call MoveNext to get a value or a promise of one
                 MoveNext();
                 // MoveNext always returns with a promise of a future value, reaching end state, or an immediately available value
             }
 
-            if (_promiseIsActive || State == -2)
+            if (_promiseIsActive || State == StateMachineStates.FinishedStateMachine)
             {
                 success = false;
                 return default;
@@ -297,6 +283,13 @@ class Program
         public IAsyncEnumerator<int> GetAsyncEnumerator()
             => this;
     }
+}
+
+internal static class StateMachineStates
+{
+    internal const int FinishedStateMachine = -2;
+    internal const int NotStartedStateMachine = -1;
+    internal const int FirstUnusedState = 0;
 }
 
 // PROTOTYPE(async-streams): Figure how to get this type
