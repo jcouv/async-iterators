@@ -87,17 +87,17 @@ class Program
         IValueTaskSource<bool>, // used as the backing store behind the ValueTask<bool> returned from each MoveNextAsync
         IStrongBox<ManualResetValueTaskSourceLogic<bool>> // exposes its ValueTaskSource logic implementation
     {
-        // If the promise is set (ie. _promiseIsActive is true), then don't check the machine state from code that isn't actively running the machine. The machine may be running on another thread.
+        // If you need to check for states other than NotStarted or Finished, then you must first ensure the promise is not set (ie. _promiseIsActive is false). Otherwise, the machine may be running on another thread.
         public int State;
 
         // awaiter and builder are used for 'await' in the method body
-        public TaskAwaiter Awaiter; // thin wrapper around a Task (that we'll be waiting on) <-- Not sure why we need to store this
+        public TaskAwaiter Awaiter; // thin wrapper around a Task (that we'll be waiting on)
         public AsyncTaskMethodBuilder Builder; // used for getting a callback to MoveNext when async code completes
 
         private int _current;
 
         #region promise
-        /// <summary>All of the logic for managing the IValueTaskSource implementation.</summary>
+        // All of the logic for managing the IValueTaskSource implementation
         public ManualResetValueTaskSourceLogic<bool> _valueOrEndPromise; // promise for a value or end (true means value found, false means finished state)
         public bool _promiseIsActive = false; // this is spiritually equivalent to saying the promise is set versus null
 
@@ -135,7 +135,7 @@ class Program
         //
         // end handshake:
         // set state (finished)
-        // if someone was promised a value, set it to done and false (finished state)
+        // set the promise to done and false (finished state)
         // return
         public void MoveNext()
         {
@@ -225,18 +225,17 @@ class Program
             }
         }
 
-        // PROTOTYPE(async-streams): update interface definition and async-foreach should recognize task-like in pattern
         // Contract: WaitForNextAsync will either return a false (no value left) or a true (found a value) with the promise set (to signal an unreturned value is stored).
         public ValueTask<bool> WaitForNextAsync()
         {
-            // PROTOTYPE(async-streams)
-            // if we have a pending promise already (ie. the async code was started by last TryGetNext), then we will use it
+            // if we have a pending promise already (ie. the async code was started by last TryGetNext), then we just return it 
             // if we don't have a pending promise, then call MoveNext()
             if (!this._promiseIsActive || State == StateMachineStates.NotStartedStateMachine)
             {
-                // PROTOTYPE(async-streams): I don't think we need this check anymore. The state machine should SetResult(false) when reaching end state.
                 MoveNext();
                 // MoveNext always returns with a promise of a future value, reaching end state, or an immediately available value
+
+                // In the case where a value is immediately available, we can rely on the last state of _valueOrEndPromise (TODO confirm this)
             }
 
             return new ValueTask<bool>(this, _valueOrEndPromise.Version);
@@ -271,7 +270,6 @@ class Program
                 return default;
             }
 
-            // PROTOTYPE(async-streams): what if the promise is failed or cancelled?
             // the machine is stopped and state has value, so return it (success)
             success = true;
             return _current;
